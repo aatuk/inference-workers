@@ -299,6 +299,218 @@ with stack_path.open("w", encoding="utf-8") as stack:
         return result
 
 
+def run_diarization_subprocess(
+    *,
+    audio_path,
+    output_csv,
+    model_name,
+    token,
+    device,
+    cache_dir,
+    min_speakers,
+    max_speakers,
+    timeout,
+    event=None,
+):
+    progress(
+        event,
+        "diarization_subprocess_start",
+        model=model_name,
+        timeout_seconds=timeout,
+        device=device,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        result_path = work / "result.json"
+        progress_path = work / "progress.jsonl"
+        stack_path = work / "stack.txt"
+        stdout_path = work / "stdout.txt"
+        stderr_path = work / "stderr.txt"
+
+        code = r"""
+import faulthandler
+import json
+import os
+import time
+from pathlib import Path
+
+result_path = Path(os.environ["DIAR_RESULT"])
+progress_path = Path(os.environ["DIAR_PROGRESS"])
+stack_path = Path(os.environ["DIAR_STACK"])
+output_csv = Path(os.environ["DIAR_OUTPUT_CSV"])
+
+
+def emit(**payload):
+    with progress_path.open("a", encoding="utf-8") as progress_file:
+        progress_file.write(json.dumps(payload, sort_keys=True) + "\n")
+
+
+def optional_int(name):
+    value = os.environ.get(name, "")
+    return int(value) if value else None
+
+
+with stack_path.open("w", encoding="utf-8") as stack:
+    faulthandler.enable(stack)
+    faulthandler.dump_traceback_later(60, repeat=True, file=stack)
+    t0 = time.perf_counter()
+    emit(stage="diarization_child_import_start")
+    import pandas as pd
+    import torch
+    from pyannote.audio import Pipeline
+    from whisperx.audio import SAMPLE_RATE, load_audio
+
+    t1 = time.perf_counter()
+    emit(stage="diarization_child_import_done", seconds=round(t1 - t0, 3))
+    emit(stage="diarization_pipeline_from_pretrained_start", model=os.environ["DIAR_MODEL"])
+    pipeline = Pipeline.from_pretrained(
+        os.environ["DIAR_MODEL"],
+        token=os.environ["HF_TOKEN"],
+        cache_dir=os.environ["DIAR_CACHE"],
+    )
+    t2 = time.perf_counter()
+    emit(stage="diarization_pipeline_from_pretrained_done", seconds=round(t2 - t1, 3))
+    emit(stage="diarization_pipeline_to_device_start", device=os.environ["DIAR_DEVICE"])
+    pipeline.to(torch.device(os.environ["DIAR_DEVICE"]))
+    t3 = time.perf_counter()
+    emit(stage="diarization_pipeline_to_device_done", seconds=round(t3 - t2, 3))
+    emit(stage="diarization_audio_load_start")
+    audio = load_audio(os.environ["DIAR_AUDIO_PATH"])
+    emit(stage="diarization_start")
+
+    ranges = {
+        "segmentation": (0.0, 50.0),
+        "embeddings": (50.0, 99.0),
+    }
+    last_percent = [0.0]
+
+    def hook(step_name, step_artifact, file=None, total=None, completed=None):
+        if total is None or completed is None or total <= 0:
+            return
+        offset, end = ranges.get(step_name, (0.0, 99.0))
+        percent = offset + min(completed / total, 1.0) * (end - offset)
+        if percent > last_percent[0]:
+            last_percent[0] = percent
+            emit(stage="diarization_progress", percent=round(float(percent), 2))
+
+    output = pipeline(
+        {"waveform": torch.from_numpy(audio[None, :]), "sample_rate": SAMPLE_RATE},
+        min_speakers=optional_int("DIAR_MIN_SPEAKERS"),
+        max_speakers=optional_int("DIAR_MAX_SPEAKERS"),
+        hook=hook,
+    )
+    emit(stage="diarization_progress", percent=100.0)
+    diarization = getattr(output, "speaker_diarization", output)
+    rows = pd.DataFrame(
+        diarization.itertracks(yield_label=True),
+        columns=["segment", "label", "speaker"],
+    )
+    if len(rows) == 0:
+        rows = pd.DataFrame(columns=["segment", "label", "speaker", "start", "end"])
+    else:
+        rows["start"] = rows["segment"].apply(lambda segment: segment.start)
+        rows["end"] = rows["segment"].apply(lambda segment: segment.end)
+    rows.to_csv(output_csv, index=False)
+    t4 = time.perf_counter()
+    emit(stage="diarization_done", segments=len(rows), seconds=round(t4 - t3, 3))
+    faulthandler.cancel_dump_traceback_later()
+    result_path.write_text(
+        json.dumps(
+            {
+                "ok": True,
+                "segments": int(len(rows)),
+                "import_seconds": round(t1 - t0, 3),
+                "from_pretrained_seconds": round(t2 - t1, 3),
+                "to_device_seconds": round(t3 - t2, 3),
+                "diarization_seconds": round(t4 - t3, 3),
+            },
+            sort_keys=True,
+        ),
+        encoding="utf-8",
+    )
+"""
+        env = os.environ.copy()
+        env.update(
+            {
+                "DIAR_RESULT": str(result_path),
+                "DIAR_PROGRESS": str(progress_path),
+                "DIAR_STACK": str(stack_path),
+                "DIAR_OUTPUT_CSV": str(output_csv),
+                "DIAR_MODEL": model_name,
+                "DIAR_CACHE": str(cache_dir),
+                "DIAR_DEVICE": str(device),
+                "DIAR_AUDIO_PATH": str(audio_path),
+                "DIAR_MIN_SPEAKERS": "" if min_speakers is None else str(min_speakers),
+                "DIAR_MAX_SPEAKERS": "" if max_speakers is None else str(max_speakers),
+                "HF_TOKEN": token,
+            }
+        )
+
+        seen_progress_lines = 0
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, "-u", "-c", code],
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+            )
+            deadline = time.monotonic() + timeout
+            timed_out = False
+            while True:
+                if progress_path.exists():
+                    lines = progress_path.read_text(encoding="utf-8").splitlines()
+                    for line in lines[seen_progress_lines:]:
+                        try:
+                            payload = json.loads(line)
+                        except json.JSONDecodeError:
+                            continue
+                        stage = payload.pop("stage", "diarization_subprocess_progress")
+                        progress(event, stage, **payload)
+                    seen_progress_lines = len(lines)
+
+                return_code = process.poll()
+                if return_code is not None:
+                    break
+                if time.monotonic() >= deadline:
+                    timed_out = True
+                    process.kill()
+                    return_code = process.wait(timeout=30)
+                    break
+                time.sleep(1)
+
+        if progress_path.exists():
+            lines = progress_path.read_text(encoding="utf-8").splitlines()
+            for line in lines[seen_progress_lines:]:
+                try:
+                    payload = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                stage = payload.pop("stage", "diarization_subprocess_progress")
+                progress(event, stage, **payload)
+
+        if timed_out or return_code != 0:
+            raise RuntimeError(
+                json.dumps(
+                    {
+                        "message": "diarization subprocess failed",
+                        "timed_out": timed_out,
+                        "return_code": return_code,
+                        "stdout_tail": tail_text(stdout_path),
+                        "stderr_tail": tail_text(stderr_path),
+                        "stack_tail": tail_text(stack_path),
+                    },
+                    sort_keys=True,
+                )
+            )
+
+        if result_path.exists():
+            result = json.loads(result_path.read_text(encoding="utf-8"))
+        else:
+            result = {"ok": True}
+        progress(event, "diarization_subprocess_done", **result)
+        return result
+
+
 def transcribe_recording(job, event=None):
     import torch
     import whisperx
@@ -315,6 +527,12 @@ def transcribe_recording(job, event=None):
     diarize_timeout = int(job.get("diarize_timeout_seconds", 30 * 60))
     diarize_pipeline_load_timeout = int(
         job.get("diarize_pipeline_load_timeout_seconds", diarize_timeout)
+    )
+    diarize_subprocess_timeout = int(
+        job.get(
+            "diarize_subprocess_timeout_seconds",
+            diarize_pipeline_load_timeout + diarize_timeout + 60,
+        )
     )
     diarization_model = job.get(
         "diarization_model",
@@ -378,6 +596,8 @@ def transcribe_recording(job, event=None):
         )
         del model
         gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         progress(event, "align_model_load_start", language=result["language"])
         model_a, metadata = whisperx.load_align_model(
@@ -397,98 +617,27 @@ def transcribe_recording(job, event=None):
         progress(event, "align_done", seconds=round(t3 - t2, 3))
         del model_a
         gc.collect()
+        if device == "cuda":
+            torch.cuda.empty_cache()
 
         diarization_path = out_dir / "recording.diarization.csv"
         if diarize:
-            progress(event, "diarization_import_start")
             import pandas as pd
-            from pyannote.audio import Pipeline
-            from whisperx.audio import SAMPLE_RATE
 
-            progress(event, "diarization_import_done")
-            progress(
-                event,
-                "diarization_pipeline_from_pretrained_start",
-                model=diarization_model,
-                timeout_seconds=diarize_pipeline_load_timeout,
-            )
-            with Timeout(diarize_pipeline_load_timeout, "diarization pipeline load"):
-                diarize_model = Pipeline.from_pretrained(
-                    diarization_model,
-                    token=token,
-                    cache_dir=str(pyannote_cache),
-                )
-            if diarize_model is None:
-                raise RuntimeError(f"failed to load diarization model {diarization_model}")
-            progress(event, "diarization_pipeline_from_pretrained_done")
-            progress(event, "diarization_pipeline_to_device_start", device=device)
-            with Timeout(diarize_pipeline_load_timeout, "diarization pipeline device move"):
-                diarize_model.to(torch.device(device))
-            progress(event, "diarization_pipeline_to_device_done")
-            progress(
-                event,
-                "diarization_start",
+            run_diarization_subprocess(
+                audio_path=audio_path,
+                output_csv=diarization_path,
+                model_name=diarization_model,
+                token=token,
+                device=device,
+                cache_dir=pyannote_cache,
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
-                timeout_seconds=diarize_timeout,
+                timeout=diarize_subprocess_timeout,
+                event=event,
             )
-
-            def diarization_progress(percent):
-                progress(
-                    event,
-                    "diarization_progress",
-                    percent=round(float(percent), 2),
-                )
-
-            diarization_step_ranges = {
-                "segmentation": (0.0, 50.0),
-                "embeddings": (50.0, 99.0),
-            }
-            last_diarization_percent = [0.0]
-
-            def diarization_hook(
-                step_name,
-                step_artifact,
-                file=None,
-                total=None,
-                completed=None,
-            ):
-                if total is None or completed is None or total <= 0:
-                    return
-                offset, end = diarization_step_ranges.get(step_name, (0.0, 99.0))
-                percent = offset + min(completed / total, 1.0) * (end - offset)
-                if percent > last_diarization_percent[0]:
-                    last_diarization_percent[0] = percent
-                    diarization_progress(percent)
-
-            with Timeout(diarize_timeout, "diarization"):
-                diarization_output = diarize_model(
-                    {
-                        "waveform": torch.from_numpy(audio[None, :]),
-                        "sample_rate": SAMPLE_RATE,
-                    },
-                    min_speakers=min_speakers,
-                    max_speakers=max_speakers,
-                    hook=diarization_hook,
-                )
-            diarization_progress(100.0)
-            diarization = getattr(
-                diarization_output,
-                "speaker_diarization",
-                diarization_output,
-            )
-            diarize_segments = pd.DataFrame(
-                diarization.itertracks(yield_label=True),
-                columns=["segment", "label", "speaker"],
-            )
-            diarize_segments["start"] = diarize_segments["segment"].apply(
-                lambda segment: segment.start
-            )
-            diarize_segments["end"] = diarize_segments["segment"].apply(
-                lambda segment: segment.end
-            )
+            diarize_segments = pd.read_csv(diarization_path)
             progress(event, "diarization_done", segments=len(diarize_segments))
-            diarize_segments.to_csv(diarization_path, index=False)
             progress(event, "speaker_assignment_start")
             result = whisperx.assign_word_speakers(diarize_segments, result)
             progress(event, "speaker_assignment_done")
@@ -503,6 +652,7 @@ def transcribe_recording(job, event=None):
             "compute_type": compute_type,
             "diarize": diarize,
             "diarization_model": diarization_model if diarize else None,
+            "diarization_backend": "subprocess" if diarize else None,
             "load_seconds": round(t1 - t0, 3),
             "transcribe_seconds": round(t2 - t1, 3),
             "align_seconds": round(t3 - t2, 3),
