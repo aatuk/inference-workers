@@ -19,6 +19,7 @@ RunPod runs the worker image on demand. The endpoint should be configured with:
 
 ```text
 Image:        ghcr.io/aatuk/inference-workers-autotranscript-whisperx:latest
+Endpoint:     nustdetgux6198 (autotranscript-whisperx-image)
 Min workers: 0
 Max workers: 1 initially
 Idle timeout: 600-1800 seconds
@@ -30,6 +31,11 @@ With min workers set to zero, there is no steady idle worker charge. A cold
 start is still billed while the worker initializes. Baking dependencies into the
 image removes the expensive `pip install` cold-start step, but the worker still
 needs time to pull the image and load models.
+
+The first smoke tests on 2026-05-21 showed the endpoint accepting jobs while
+RunPod left the worker `throttled`; those test jobs were cancelled. This appears
+to be RunPod scheduling/capacity rather than a GitHub or image publication
+problem.
 
 ## What The VPS Provides
 
