@@ -6,6 +6,8 @@ import mimetypes
 import os
 import signal
 import shutil
+import subprocess
+import sys
 import tempfile
 import time
 import urllib.parse
@@ -177,6 +179,124 @@ def truthy(value):
     if value is None:
         return False
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def tail_text(path, limit=12000):
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except FileNotFoundError:
+        return ""
+    return text[-limit:]
+
+
+def pyannote_from_pretrained_diagnostic(job, event=None):
+    model_name = job.get(
+        "diarization_model",
+        "pyannote/speaker-diarization-community-1",
+    )
+    timeout = int(job.get("timeout_seconds", 120))
+    stack_after = int(job.get("stack_after_seconds", 30))
+    move_to_device = job.get("move_to_device") or ""
+    token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
+    if not token:
+        raise RuntimeError("HF_TOKEN is required for pyannote diagnostics")
+
+    progress(
+        event,
+        "pyannote_diagnostic_start",
+        model=model_name,
+        timeout_seconds=timeout,
+        move_to_device=move_to_device or None,
+    )
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        result_path = work / "result.json"
+        stack_path = work / "stack.txt"
+        stdout_path = work / "stdout.txt"
+        stderr_path = work / "stderr.txt"
+        cache_dir = Path(os.environ.get("AUTOTRANSCRIPT_PYANNOTE_CACHE", "/models/pyannote"))
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+        code = r"""
+import faulthandler
+import json
+import os
+import time
+from pathlib import Path
+
+result_path = Path(os.environ["DIAG_RESULT"])
+stack_path = Path(os.environ["DIAG_STACK"])
+with stack_path.open("w", encoding="utf-8") as stack:
+    faulthandler.enable(stack)
+    faulthandler.dump_traceback_later(
+        int(os.environ["DIAG_STACK_AFTER"]),
+        repeat=True,
+        file=stack,
+    )
+    t0 = time.perf_counter()
+    from pyannote.audio import Pipeline
+    t1 = time.perf_counter()
+    pipeline = Pipeline.from_pretrained(
+        os.environ["DIAG_MODEL"],
+        token=os.environ["HF_TOKEN"],
+        cache_dir=os.environ["DIAG_CACHE"],
+    )
+    t2 = time.perf_counter()
+    out = {
+        "ok": True,
+        "import_seconds": round(t1 - t0, 3),
+        "from_pretrained_seconds": round(t2 - t1, 3),
+        "pipeline_type": type(pipeline).__name__,
+    }
+    device = os.environ.get("DIAG_MOVE_TO_DEVICE")
+    if device:
+        import torch
+
+        pipeline.to(torch.device(device))
+        out["to_device_seconds"] = round(time.perf_counter() - t2, 3)
+    faulthandler.cancel_dump_traceback_later()
+    result_path.write_text(json.dumps(out, sort_keys=True), encoding="utf-8")
+"""
+        env = os.environ.copy()
+        env.update(
+            {
+                "DIAG_RESULT": str(result_path),
+                "DIAG_STACK": str(stack_path),
+                "DIAG_STACK_AFTER": str(stack_after),
+                "DIAG_MODEL": model_name,
+                "DIAG_CACHE": str(cache_dir),
+                "HF_TOKEN": token,
+                "DIAG_MOVE_TO_DEVICE": str(move_to_device),
+            }
+        )
+        with stdout_path.open("wb") as stdout, stderr_path.open("wb") as stderr:
+            process = subprocess.Popen(
+                [sys.executable, "-u", "-c", code],
+                stdout=stdout,
+                stderr=stderr,
+                env=env,
+            )
+            try:
+                return_code = process.wait(timeout=timeout)
+                timed_out = False
+            except subprocess.TimeoutExpired:
+                process.kill()
+                return_code = process.wait(timeout=30)
+                timed_out = True
+
+        result = {
+            "ok": not timed_out and return_code == 0,
+            "timed_out": timed_out,
+            "return_code": return_code,
+            "model": model_name,
+            "stdout_tail": tail_text(stdout_path),
+            "stderr_tail": tail_text(stderr_path),
+            "stack_tail": tail_text(stack_path),
+        }
+        if result_path.exists():
+            result["child_result"] = json.loads(result_path.read_text(encoding="utf-8"))
+        progress(event, "pyannote_diagnostic_done", ok=result["ok"], timed_out=timed_out)
+        return result
 
 
 def transcribe_recording(job, event=None):
@@ -436,6 +556,8 @@ def transcribe_recording(job, event=None):
 
 def handler(event):
     job = event.get("input", event)
+    if job.get("diagnostic") == "pyannote_from_pretrained":
+        return pyannote_from_pretrained_diagnostic(job, event)
     return transcribe_recording(job, event)
 
 
