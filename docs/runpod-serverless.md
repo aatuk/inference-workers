@@ -44,9 +44,38 @@ workerId: 381f7fhofg84yu
 ```
 
 A diarization smoke job then started immediately on the same worker but remained
-in progress for about 14 minutes and was cancelled. That looks like a
-pyannote/diarization runtime or model-download issue, not a GPU scheduling
-issue.
+in progress for about 14 minutes and was cancelled. Follow-up diagnostics found
+the precise hang point:
+
+```text
+Pipeline.from_pretrained("pyannote/speaker-diarization-community-1")
+```
+
+The Hugging Face token can read `pyannote/speaker-diarization-community-1`.
+Direct child-process diagnostics loaded that pipeline in about 2.3 seconds, so
+the model and token were not the underlying problem. The hang reproduced only
+when pyannote loading happened inside the same long-lived Python process after
+WhisperX transcription/alignment had already run.
+
+The worker now runs pyannote diarization in a short-lived child process, writes
+`recording.diarization.csv`, then lets the parent process do WhisperX speaker
+assignment. A tiny diarized smoke job on 2026-05-21 completed with:
+
+```text
+executionTime: 48.813s
+diarization backend: subprocess
+diarize_seconds: 16.391s
+diarization model: pyannote/speaker-diarization-community-1
+```
+
+The older `pyannote/speaker-diarization-3.1` model currently fails fast with a
+403 because this Hugging Face token has not been granted access to that gated
+model. It is not the active default.
+
+RunPod placement remains noisy. During the same debugging session some workers
+sat `throttled` or `initializing` for several minutes, and stale workers from an
+older endpoint version kept taking jobs until a fresh temporary endpoint was
+used.
 
 ## What The VPS Provides
 
