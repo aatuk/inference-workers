@@ -4,6 +4,7 @@ import json
 import math
 import mimetypes
 import os
+import signal
 import shutil
 import tempfile
 import time
@@ -14,6 +15,59 @@ from pathlib import Path
 from xml.sax.saxutils import escape
 
 import runpod
+
+
+def log_event(level, message, **fields):
+    print(
+        json.dumps(
+            {
+                "level": level,
+                "message": message,
+                **fields,
+            },
+            sort_keys=True,
+        ),
+        flush=True,
+    )
+
+
+def progress(event, stage, **fields):
+    payload = {"stage": stage, **fields}
+    log_event("INFO", "progress", **payload)
+    if event is None:
+        return
+    try:
+        runpod.serverless.progress_update(event, payload)
+    except AttributeError:
+        try:
+            from runpod.serverless import progress_update
+
+            progress_update(event, payload)
+        except Exception as exc:
+            log_event("WARNING", "progress_update failed", error=str(exc))
+    except Exception as exc:
+        log_event("WARNING", "progress_update failed", error=str(exc))
+
+
+class Timeout:
+    def __init__(self, seconds, label):
+        self.seconds = int(seconds)
+        self.label = label
+        self.previous = None
+
+    def __enter__(self):
+        if self.seconds <= 0:
+            return
+        self.previous = signal.signal(signal.SIGALRM, self._handle_timeout)
+        signal.alarm(self.seconds)
+
+    def __exit__(self, exc_type, exc, tb):
+        if self.seconds > 0:
+            signal.alarm(0)
+            signal.signal(signal.SIGALRM, self.previous)
+
+    def _handle_timeout(self, signum, frame):
+        raise TimeoutError(f"{self.label} exceeded {self.seconds}s")
 
 
 def jsonable(value):
@@ -125,7 +179,7 @@ def truthy(value):
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
-def transcribe_recording(job):
+def transcribe_recording(job, event=None):
     import torch
     import whisperx
 
@@ -138,6 +192,7 @@ def transcribe_recording(job):
     max_speakers = job.get("max_speakers")
     batch_size = int(job.get("batch_size", 16))
     compute_type = job.get("compute_type", "float16")
+    diarize_timeout = int(job.get("diarize_timeout_seconds", 30 * 60))
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
     if diarize and not token:
@@ -146,6 +201,15 @@ def transcribe_recording(job):
     device = "cuda" if torch.cuda.is_available() else "cpu"
     if device == "cpu" and compute_type == "float16":
         compute_type = "int8"
+    progress(
+        event,
+        "received",
+        model=model_name,
+        language=language,
+        diarize=diarize,
+        device=device,
+        compute_type=compute_type,
+    )
 
     suffix = Path(urllib.parse.urlsplit(input_url).path).suffix or ".audio"
     model_dir = Path(os.environ.get("AUTOTRANSCRIPT_MODEL_CACHE", "/models/whisperx"))
@@ -158,9 +222,12 @@ def transcribe_recording(job):
         audio_path = work / f"recording{suffix}"
         out_dir = work / "out"
         out_dir.mkdir()
+        progress(event, "download_start")
         download(input_url, audio_path)
+        progress(event, "download_done", bytes=audio_path.stat().st_size)
 
         t0 = time.perf_counter()
+        progress(event, "whisper_model_load_start")
         model = whisperx.load_model(
             model_name,
             device,
@@ -169,16 +236,27 @@ def transcribe_recording(job):
             download_root=str(model_dir),
         )
         t1 = time.perf_counter()
+        progress(event, "whisper_model_load_done", seconds=round(t1 - t0, 3))
         audio = whisperx.load_audio(str(audio_path))
+        progress(event, "transcribe_start", batch_size=batch_size)
         result = model.transcribe(audio, batch_size=batch_size, language=language)
         t2 = time.perf_counter()
+        progress(
+            event,
+            "transcribe_done",
+            seconds=round(t2 - t1, 3),
+            segments=len(result.get("segments", [])),
+            detected_language=result.get("language"),
+        )
         del model
         gc.collect()
 
+        progress(event, "align_model_load_start", language=result["language"])
         model_a, metadata = whisperx.load_align_model(
             language_code=result["language"],
             device=device,
         )
+        progress(event, "align_start")
         result = whisperx.align(
             result["segments"],
             model_a,
@@ -188,23 +266,37 @@ def transcribe_recording(job):
             return_char_alignments=False,
         )
         t3 = time.perf_counter()
+        progress(event, "align_done", seconds=round(t3 - t2, 3))
         del model_a
         gc.collect()
 
         diarization_path = out_dir / "recording.diarization.csv"
         if diarize:
+            progress(event, "diarization_pipeline_load_start")
             diarize_model = whisperx.diarize.DiarizationPipeline(
                 token=token,
                 device=device,
                 cache_dir=str(pyannote_cache),
             )
-            diarize_segments = diarize_model(
-                str(audio_path),
+            progress(event, "diarization_pipeline_load_done")
+            progress(
+                event,
+                "diarization_start",
                 min_speakers=min_speakers,
                 max_speakers=max_speakers,
+                timeout_seconds=diarize_timeout,
             )
+            with Timeout(diarize_timeout, "diarization"):
+                diarize_segments = diarize_model(
+                    str(audio_path),
+                    min_speakers=min_speakers,
+                    max_speakers=max_speakers,
+                )
+            progress(event, "diarization_done", segments=len(diarize_segments))
             diarize_segments.to_csv(diarization_path, index=False)
+            progress(event, "speaker_assignment_start")
             result = whisperx.assign_word_speakers(diarize_segments, result)
+            progress(event, "speaker_assignment_done")
         else:
             diarization_path.write_text("diarization disabled\n", encoding="utf-8")
         t4 = time.perf_counter()
@@ -257,16 +349,18 @@ def transcribe_recording(job):
         markdown_path.write_text("\n".join(lines), encoding="utf-8")
         write_docx_from_markdown(markdown_path, docx_path)
 
+        progress(event, "upload_start")
         uploaded = {
             path.name: upload(output_base_url, path)
             for path in [markdown_path, docx_path, whisperx_path, diarization_path]
         }
+        progress(event, "upload_done", files=list(uploaded))
         return {"summary": summary, "uploaded": uploaded}
 
 
 def handler(event):
     job = event.get("input", event)
-    return transcribe_recording(job)
+    return transcribe_recording(job, event)
 
 
 if __name__ == "__main__":
