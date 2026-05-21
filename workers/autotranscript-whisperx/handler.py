@@ -280,20 +280,31 @@ def transcribe_recording(job, event=None):
 
         diarization_path = out_dir / "recording.diarization.csv"
         if diarize:
+            progress(event, "diarization_import_start")
+            import pandas as pd
+            from pyannote.audio import Pipeline
+            from whisperx.audio import SAMPLE_RATE
+
+            progress(event, "diarization_import_done")
             progress(
                 event,
-                "diarization_pipeline_load_start",
+                "diarization_pipeline_from_pretrained_start",
                 model=diarization_model,
                 timeout_seconds=diarize_pipeline_load_timeout,
             )
             with Timeout(diarize_pipeline_load_timeout, "diarization pipeline load"):
-                diarize_model = whisperx.diarize.DiarizationPipeline(
-                    model_name=diarization_model,
+                diarize_model = Pipeline.from_pretrained(
+                    diarization_model,
                     token=token,
-                    device=device,
                     cache_dir=str(pyannote_cache),
                 )
-            progress(event, "diarization_pipeline_load_done")
+            if diarize_model is None:
+                raise RuntimeError(f"failed to load diarization model {diarization_model}")
+            progress(event, "diarization_pipeline_from_pretrained_done")
+            progress(event, "diarization_pipeline_to_device_start", device=device)
+            with Timeout(diarize_pipeline_load_timeout, "diarization pipeline device move"):
+                diarize_model.to(torch.device(device))
+            progress(event, "diarization_pipeline_to_device_done")
             progress(
                 event,
                 "diarization_start",
@@ -309,13 +320,53 @@ def transcribe_recording(job, event=None):
                     percent=round(float(percent), 2),
                 )
 
+            diarization_step_ranges = {
+                "segmentation": (0.0, 50.0),
+                "embeddings": (50.0, 99.0),
+            }
+            last_diarization_percent = [0.0]
+
+            def diarization_hook(
+                step_name,
+                step_artifact,
+                file=None,
+                total=None,
+                completed=None,
+            ):
+                if total is None or completed is None or total <= 0:
+                    return
+                offset, end = diarization_step_ranges.get(step_name, (0.0, 99.0))
+                percent = offset + min(completed / total, 1.0) * (end - offset)
+                if percent > last_diarization_percent[0]:
+                    last_diarization_percent[0] = percent
+                    diarization_progress(percent)
+
             with Timeout(diarize_timeout, "diarization"):
-                diarize_segments = diarize_model(
-                    str(audio_path),
+                diarization_output = diarize_model(
+                    {
+                        "waveform": torch.from_numpy(audio[None, :]),
+                        "sample_rate": SAMPLE_RATE,
+                    },
                     min_speakers=min_speakers,
                     max_speakers=max_speakers,
-                    progress_callback=diarization_progress,
+                    hook=diarization_hook,
                 )
+            diarization_progress(100.0)
+            diarization = getattr(
+                diarization_output,
+                "speaker_diarization",
+                diarization_output,
+            )
+            diarize_segments = pd.DataFrame(
+                diarization.itertracks(yield_label=True),
+                columns=["segment", "label", "speaker"],
+            )
+            diarize_segments["start"] = diarize_segments["segment"].apply(
+                lambda segment: segment.start
+            )
+            diarize_segments["end"] = diarize_segments["segment"].apply(
+                lambda segment: segment.end
+            )
             progress(event, "diarization_done", segments=len(diarize_segments))
             diarize_segments.to_csv(diarization_path, index=False)
             progress(event, "speaker_assignment_start")
