@@ -32,10 +32,21 @@ start is still billed while the worker initializes. Baking dependencies into the
 image removes the expensive `pip install` cold-start step, but the worker still
 needs time to pull the image and load models.
 
-The first smoke tests on 2026-05-21 showed the endpoint accepting jobs while
-RunPod left the worker `throttled`; those test jobs were cancelled. This appears
-to be RunPod scheduling/capacity rather than a GitHub or image publication
-problem.
+The first smoke tests on 2026-05-21 initially showed the endpoint accepting jobs
+while RunPod left the worker `throttled`; those queued tests were cancelled.
+After waiting, RunPod provisioned a ready worker and a non-diarized `tiny` model
+smoke job completed successfully on CUDA:
+
+```text
+delayTime: 124.668s
+executionTime: 17.838s
+workerId: 381f7fhofg84yu
+```
+
+A diarization smoke job then started immediately on the same worker but remained
+in progress for about 14 minutes and was cancelled. That looks like a
+pyannote/diarization runtime or model-download issue, not a GPU scheduling
+issue.
 
 ## What The VPS Provides
 
