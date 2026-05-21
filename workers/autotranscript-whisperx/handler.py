@@ -193,6 +193,13 @@ def transcribe_recording(job, event=None):
     batch_size = int(job.get("batch_size", 16))
     compute_type = job.get("compute_type", "float16")
     diarize_timeout = int(job.get("diarize_timeout_seconds", 30 * 60))
+    diarize_pipeline_load_timeout = int(
+        job.get("diarize_pipeline_load_timeout_seconds", diarize_timeout)
+    )
+    diarization_model = job.get(
+        "diarization_model",
+        "pyannote/speaker-diarization-community-1",
+    )
 
     token = os.environ.get("HF_TOKEN") or os.environ.get("HUGGINGFACE_TOKEN") or ""
     if diarize and not token:
@@ -209,6 +216,7 @@ def transcribe_recording(job, event=None):
         diarize=diarize,
         device=device,
         compute_type=compute_type,
+        diarization_model=diarization_model if diarize else None,
     )
 
     suffix = Path(urllib.parse.urlsplit(input_url).path).suffix or ".audio"
@@ -272,12 +280,19 @@ def transcribe_recording(job, event=None):
 
         diarization_path = out_dir / "recording.diarization.csv"
         if diarize:
-            progress(event, "diarization_pipeline_load_start")
-            diarize_model = whisperx.diarize.DiarizationPipeline(
-                token=token,
-                device=device,
-                cache_dir=str(pyannote_cache),
+            progress(
+                event,
+                "diarization_pipeline_load_start",
+                model=diarization_model,
+                timeout_seconds=diarize_pipeline_load_timeout,
             )
+            with Timeout(diarize_pipeline_load_timeout, "diarization pipeline load"):
+                diarize_model = whisperx.diarize.DiarizationPipeline(
+                    model_name=diarization_model,
+                    token=token,
+                    device=device,
+                    cache_dir=str(pyannote_cache),
+                )
             progress(event, "diarization_pipeline_load_done")
             progress(
                 event,
@@ -286,11 +301,20 @@ def transcribe_recording(job, event=None):
                 max_speakers=max_speakers,
                 timeout_seconds=diarize_timeout,
             )
+
+            def diarization_progress(percent):
+                progress(
+                    event,
+                    "diarization_progress",
+                    percent=round(float(percent), 2),
+                )
+
             with Timeout(diarize_timeout, "diarization"):
                 diarize_segments = diarize_model(
                     str(audio_path),
                     min_speakers=min_speakers,
                     max_speakers=max_speakers,
+                    progress_callback=diarization_progress,
                 )
             progress(event, "diarization_done", segments=len(diarize_segments))
             diarize_segments.to_csv(diarization_path, index=False)
@@ -307,6 +331,7 @@ def transcribe_recording(job, event=None):
             "device": device,
             "compute_type": compute_type,
             "diarize": diarize,
+            "diarization_model": diarization_model if diarize else None,
             "load_seconds": round(t1 - t0, 3),
             "transcribe_seconds": round(t2 - t1, 3),
             "align_seconds": round(t3 - t2, 3),
